@@ -578,15 +578,22 @@ async def downloadAssets(base, base_page_text):
         raise Exception("Unable to extract js files and css files from showcase runtime js file")
     groupDict = match.groupdict()
     jsNamedDict = extractJSDict("showcase-runtime.js: namedJSFiles", groupDict["namedJSFiles"])
-    jsKeyDict = extractJSDict("showcase-runtime.js: JSFileToKey", groupDict["JSFileToKey"])
+    # Newer showcase builds (2026+) dropped the content hash from chunk filenames so there is no id->hash dict, chunks are just js/[name or id].js
+    jsHasHashes = "{" in groupDict["JSFileToKey"]
+    jsKeyDict = extractJSDict("showcase-runtime.js: JSFileToKey", groupDict["JSFileToKey"]) if jsHasHashes else {}
     cssNamedDict = extractJSDict("showcase-runtime.js: namedCSSFiles", groupDict["namedCSSFiles"])
     cssKeyDict = extractJSDict("showcase-runtime.js: CSSFileToKey", groupDict["CSSFileToKey"])
 
-    for number, key in jsKeyDict.items():
-        name = number
-        if name in jsNamedDict:
-            name = jsNamedDict[name]
-        file = f"js/{name}.{key}.js"
+    def jsChunkFile(number: str):
+        name = jsNamedDict.get(number, number)
+        return f"js/{name}.{jsKeyDict[number]}.js" if jsHasHashes else f"js/{name}.js"
+
+    if jsHasHashes:
+        chunkIds = list(jsKeyDict.keys())  # the hash dict enumerates every chunk
+    else:
+        chunkIds = list(jsNamedDict.keys())  # unnamed chunks get discovered below by scanning bundles for .e(id) loads
+    for number in chunkIds:
+        file = jsChunkFile(number)
         typeDict[file] = "SHOWCASE_DISCOVERED_JS"
         assets.append(file)
 
@@ -623,6 +630,28 @@ async def downloadAssets(base, base_page_text):
         shouldExist = True
         toDownload.append(AsyncDownloadItem(type, shouldExist, f"{base}{asset}", local_file))
     await AsyncArrayDownload(toDownload)
+    if not jsHasHashes:  # without a hash dict we find unnamed chunks by scanning every downloaded bundle for webpack .e(chunkId) loads, repeating as chunks can load more chunks
+        knownChunkFiles = set(f for f in typeDict if typeDict[f] == "SHOWCASE_DISCOVERED_JS")
+        scanned: set[str] = set()
+        while True:
+            toDownload.clear()
+            for jsFile in sorted(pathlib.Path("js").glob("*.js")):
+                jsFile = jsFile.as_posix()
+                if jsFile in scanned or ".modified." in jsFile:
+                    continue
+                scanned.add(jsFile)
+                with open(jsFile, "r", encoding="UTF-8", errors="ignore") as f:
+                    jsText = f.read()
+                    for chunkId in set(re.findall(r"\.e\(([0-9]{1,6})\)", jsText)) | set(re.findall(r'":\[[0-9]+,([0-9]{1,6})\]', jsText)):  # second form is webpack context modules (dynamic import with variable path) as "./file":[moduleId,chunkId]
+                        file = jsChunkFile(chunkId)
+                        if file not in knownChunkFiles:
+                            knownChunkFiles.add(file)
+                            typeDict[file] = "SHOWCASE_DISCOVERED_JS"
+                            toDownload.append(AsyncDownloadItem("SHOWCASE_DISCOVERED_JS", False, f"{base}{file}", file))
+            if not toDownload:
+                break
+            consoleDebugLog(f"Discovered {len(toDownload)} more js chunks to download")
+            await AsyncArrayDownload(toDownload)
     if react_vendor_filename and os.path.exists(react_vendor_filename):
         reactCont = ""
         with open(react_vendor_filename, "r", encoding="UTF-8") as f:
@@ -807,7 +836,7 @@ def patchShowcase():
         j = j.replace('"/api/mp/', '`${window.location.pathname}`+"api/mp/')
         j = j.replace("${this.baseUrl}", "${window.location.origin}${window.location.pathname}")
 
-    j = j.replace(f'e.get("https://static.{BASE_MATTERPORT_DOMAIN}/geoip/",{{responseType:"json",priority:n.ru.LOW}})', '{"country_code":"US","country_name":"united states","region":"CA","city":"los angeles"}')
+    j = re.sub(rf'e\.get\("https://static\.{re.escape(BASE_MATTERPORT_DOMAIN)}/geoip/",\{{responseType:"json",priority:[a-zA-Z0-9_.$]+\}}\)', '{"country_code":"US","country_name":"united states","region":"CA","city":"los angeles"}', j)  # minified priority var name changes between builds
     if CLA.getCommandLineArg(CommandLineArg.MANUAL_HOST_REPLACEMENT):
         j = j.replace(f"https://static.{BASE_MATTERPORT_DOMAIN}", "")
     with open(getModifiedName(MAIN_SHOWCASE_FILENAME), "w", encoding="UTF-8") as f:
